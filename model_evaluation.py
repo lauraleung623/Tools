@@ -2,8 +2,26 @@ import torch
 from ultralytics import YOLO
 import numpy as np
 import cv2
+import matplotlib
 import matplotlib.pyplot as plt
+from matplotlib import font_manager
 from PIL import Image
+
+
+def setup_matplotlib():
+    """配置中文字体，并在无 GUI 环境下跳过 plt.show()"""
+    for name in ("Microsoft YaHei", "SimHei", "SimSun", "KaiTi", "FangSong"):
+        if any(f.name == name for f in font_manager.fontManager.ttflist):
+            plt.rcParams["font.sans-serif"] = [name, "DejaVu Sans"]
+            break
+    plt.rcParams["axes.unicode_minus"] = False
+
+
+def show_figure(fig):
+    """有 GUI 时显示图表，否则仅保存后关闭"""
+    if "agg" not in matplotlib.get_backend().lower():
+        plt.show()
+    plt.close(fig)
 
 
 def get_feature_vector(model,image_path):
@@ -17,6 +35,10 @@ def get_feature_vector(model,image_path):
     # results 是一个列表，取第一张图的特征
     # 特征通常是 PyTorch Tensor 格式，先转为 numpy
     features = results[0].cpu().numpy().flatten()
+
+    # embed() 会持久化 predictor 的 embed 参数，后续 predict 需显式关闭
+    if model.predictor is not None:
+        model.predictor.args.embed = None
     
     return features
 
@@ -77,7 +99,7 @@ def load_and_align_images(img1_path, img2_path, target_size=None):
     img1_aligned = resize_to_target(img1, target_w, target_h)
     img2_aligned = resize_to_target(img2, target_w, target_h)
     
-    return img1_aligned, img2_aligned, (target_h, target_w)
+    return img1_aligned, img2_aligned, (target_h, target_w), (h1, w1), (h2, w2)
 
 def interpolate_images(img1, img2, alpha):
     """在两张图像之间进行线性插值"""
@@ -93,15 +115,15 @@ def analyze_detection_with_size_variation(model, img1_path, img2_path, num_steps
     - 分别测试原尺寸和对齐尺寸的效果
     """
     # 1. 加载并对齐图片
-    img1_aligned, img2_aligned, aligned_size = load_and_align_images(
+    img1_aligned, img2_aligned, aligned_size, (h1, w1), (h2, w2) = load_and_align_images(
         img1_path, img2_path, target_size
     )
     
     # 2. 可选：同时测试原始尺寸（仅模型推理，不用于插值）
-    print("\n--- 原始尺寸推理结果（参考）---")
+    print("/n--- 原始尺寸推理结果（参考）---")
     original_results = {}
     for path, name in [(img1_path, "图片1"), (img2_path, "图片2")]:
-        pred = model(path)[0]
+        pred = model.predict(path, embed=None)[0]
         if pred.boxes is not None and len(pred.boxes) > 0:
             top = pred.boxes[0]
             top_cls = int(top.cls.item())
@@ -117,7 +139,7 @@ def analyze_detection_with_size_variation(model, img1_path, img2_path, num_steps
             original_results[name] = None
     
     # 3. 插值实验（使用对齐后的图片）
-    print("\n--- 开始插值实验（对齐尺寸后）---")
+    print("/n--- 开始插值实验（对齐尺寸后）---")
     results = []
     alphas = np.linspace(0, 1, num_steps)
     
@@ -126,7 +148,7 @@ def analyze_detection_with_size_variation(model, img1_path, img2_path, num_steps
         mixed_img_uint8 = (mixed_img * 255).astype(np.uint8)
         
         # 检测预测
-        pred = model(mixed_img_uint8)[0]
+        pred = model.predict(mixed_img_uint8, embed=None)[0]
         
         # 提取检测结果
         detections = []
@@ -154,7 +176,7 @@ def analyze_detection_with_size_variation(model, img1_path, img2_path, num_steps
         if int(alpha * num_steps) % (num_steps // 5) == 0:
             print(f"  进度: {alpha:.1%} - 检测到 {len(detections)} 个目标")
     
-    return results, alphas, original_results, aligned_size
+    return results, alphas, original_results, aligned_size, (h1, w1), (h2, w2)
 
 def diagnose_with_size_awareness(results, alphas, original_results, aligned_size):
     """
@@ -239,8 +261,9 @@ def diagnose_with_size_awareness(results, alphas, original_results, aligned_size
     }
 
 # 可视化（考虑尺寸信息的版本）
-def visualize_with_size_info(results, alphas, original_results, aligned_size):
+def visualize_with_size_info(results, alphas, original_results, aligned_size, img1_size, img2_size):
     """生成包含尺寸信息的可视化报告"""
+    setup_matplotlib()
     confidences = [r['top_confidence'] for r in results]
     has_obj = [1 if r['has_object'] else 0 for r in results]
     num_dets = [r['num_detections'] for r in results]
@@ -269,16 +292,18 @@ def visualize_with_size_info(results, alphas, original_results, aligned_size):
     axes[0, 2].grid(True)
     
     # 第二行：原始信息
+    h1, w1 = img1_size
+    h2, w2 = img2_size
     axes[1, 0].axis('off')
     axes[1, 0].set_title('原始尺寸对比')
-    info_text = f"图片1尺寸: ?×? (原始)\n图片2尺寸: ?×? (原始)\n"
-    info_text += f"图片1检测: {original_results['图片1']['confidence']:.3f}\n" if original_results['图片1'] else "图片1: 未检测到\n"
+    info_text = f"图片1尺寸: {w1}×{h1} (原始)/n图片2尺寸: {w2}×{h2} (原始)/n"
+    info_text += f"图片1检测: {original_results['图片1']['confidence']:.3f}/n" if original_results['图片1'] else "图片1: 未检测到/n"
     info_text += f"图片2检测: {original_results['图片2']['confidence']:.3f}" if original_results['图片2'] else "图片2: 未检测到"
     axes[1, 0].text(0.1, 0.5, info_text, fontsize=10, va='center')
     
     axes[1, 1].axis('off')
     axes[1, 1].set_title('诊断建议')
-    diagnosis_text = "决策边界突变数量: {}\n目标消失次数: {}\n置信度稳定性: {:.3f}".format(
+    diagnosis_text = "决策边界突变数量: {}/n目标消失次数: {}/n置信度稳定性: {:.3f}".format(
         sum(abs(confidences[i] - confidences[i-1]) > 0.3 for i in range(1, len(confidences))),
         sum(abs(has_obj[i] - has_obj[i-1]) for i in range(1, len(has_obj))),
         np.std(confidences)
@@ -290,35 +315,35 @@ def visualize_with_size_info(results, alphas, original_results, aligned_size):
     
     plt.tight_layout()
     plt.savefig('detection_size_aware_analysis.png', dpi=150, bbox_inches='tight')
-    plt.show()
+    show_figure(fig)
 
 
 if __name__ == "__main__":
-    model = YOLO("D:/ReferenceCode/ultralytics-main/ultralytics-main/models_backup/train13_500epoch/weights/best.pt")     
+    model = YOLO("D:/ReferenceCode/ultralytics-main/ultralytics-main/runs/detect/train18/weights/best.pt")     
 
-    # # Mark 计算两幅图特诊相近程度
-    # model.eval() # 切换到评估模式
-    # img1_path = "D:/dissolution/vials/vials1n2nsuspension/crops/images/val/reagent/Apr20_2818-69-1_123-91-1_a0_back.bmp"
-    # img2_path = "D:/dissolution/vials/vials1n2nsuspension/crops/images/val/reagent/Apr20_2818-69-1_123-91-1_a1_back.bmp"
+    # Mark 计算两幅图特诊相近程度
+    model.eval() # 切换到评估模式
+    img1_path = "D:/dissolution/myself/Apr16/19_2818-69-1_64-17-5/Apr16_19_2818-69-1_64-17-5_a2_back.bmp"
+    img2_path = "D:/dissolution/myself/Apr15/6_2237-30-1_68-12-2/Apr15_2237-30-1&68-12-2_a3_back.bmp"
 
-    # # 提取特征
-    # vec1 = get_feature_vector(model,img1_path)
-    # vec2 = get_feature_vector(model,img2_path)
+    # 提取特征
+    vec1 = get_feature_vector(model,img1_path)
+    vec2 = get_feature_vector(model,img2_path)
 
-    # # 打印维度，确认提取成功
-    # print(f"特征向量维度: {vec1.shape}")
+    # 打印维度，确认提取成功
+    print(f"特征向量维度: {vec1.shape}")
 
-    # # 计算相似度
-    # sim_score = cosine_similarity(vec1, vec2)
+    # 计算相似度
+    sim_score = cosine_similarity(vec1, vec2)
 
-    # # 结果解释：范围在 [-1, 1] 之间，越接近 1 代表两张图在高维空间中越相似
-    # print(f"图片相似度: {sim_score:.4f}")
+    # 结果解释：范围在 [-1, 1] 之间，越接近 1 代表两张图在高维空间中越相似
+    print(f"图片相似度: {sim_score:.4f}")
 
     # Mark 线性插值探测决策边界 
-    img1_path="D:/dissolution/vials/vials1n2nsuspension/crops/images/val/reagent/Apr20_2818-69-1_123-91-1_a0_back.bmp"
-    img2_path="D:/dissolution/vials/vials1n2nsuspension/crops/images/val/reagent/Apr20_2818-69-1_123-91-1_a1_back.bmp"
+    img1_path="D:/dissolution/myself/Apr16/19_2818-69-1_64-17-5/Apr16_19_2818-69-1_64-17-5_a2_back.bmp"
+    img2_path="D:/dissolution/myself/Apr15/6_2237-30-1_68-12-2/Apr15_2237-30-1&68-12-2_a3_back.bmp"
     
-    results, alphas, original_results, aligned_size = analyze_detection_with_size_variation(
+    results, alphas, original_results, aligned_size, img1_size, img2_size = analyze_detection_with_size_variation(
         model, 
         img1_path,   # 可能是 640×640
         img2_path,   # 可能是 641×638
@@ -330,6 +355,6 @@ if __name__ == "__main__":
     diagnosis = diagnose_with_size_awareness(results, alphas, original_results, aligned_size)
     
     # 可视化
-    visualize_with_size_info(results, alphas, original_results, aligned_size)
+    visualize_with_size_info(results, alphas, original_results, aligned_size, img1_size, img2_size)
     
-    print(f"\n最终诊断: {diagnosis['diagnosis']}")
+    print(f"/n最终诊断: {diagnosis['diagnosis']}")
